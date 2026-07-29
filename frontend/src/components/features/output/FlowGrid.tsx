@@ -418,7 +418,7 @@ function NodeCard({
       },
     };
 
-  const s = styles[status];
+  const s = styles[status] || styles.waiting;
 
   return (
     <div

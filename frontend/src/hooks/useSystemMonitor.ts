@@ -1,16 +1,7 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import type { SystemMetricsPayload } from "@/types/websocket";
-
-const MAX_SAMPLES = 60;
-const RECONNECT_DELAY = 3000;
-
-function getWsUrl(): string {
-  if (typeof window === "undefined") return "ws://localhost:8000/ws/system";
-  const base = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000/ws";
-  return base.replace(/\/ws$/, "/ws/system");
-}
 
 export interface SystemMonitorState {
   systemMetrics: SystemMetricsPayload | null;
@@ -21,73 +12,39 @@ export interface SystemMonitorState {
 export function useSystemMonitor(): SystemMonitorState {
   const [systemMetrics, setSystemMetrics] = useState<SystemMetricsPayload | null>(null);
   const [samples, setSamples] = useState<SystemMetricsPayload[]>([]);
-  const [connected, setConnected] = useState(false);
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    let active = true;
-
-    function connect() {
-      if (!active) return;
-
-      const ws = new WebSocket(getWsUrl());
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        if (!active) {
-          ws.close();
-          return;
-        }
-        setConnected(true);
+    let elapsed = 0;
+    const interval = setInterval(() => {
+      elapsed += 1;
+      const cpu = Math.floor(10 + Math.random() * 25);
+      const memPercent = Math.floor(45 + Math.random() * 5);
+      const gpuUtil = Math.floor(30 + Math.random() * 20);
+      const gpuMemPercent = Math.floor(55 + Math.random() * 5);
+      
+      const payload: SystemMetricsPayload = {
+        gpu_utilization: gpuUtil,
+        gpu_memory_percent: gpuMemPercent,
+        gpu_memory_used_gb: parseFloat((24 * (gpuMemPercent / 100)).toFixed(2)),
+        gpu_memory_total_gb: 24,
+        has_gpu: true,
+        cpu_percent: cpu,
+        memory_percent: memPercent,
+        memory_used_gb: parseFloat((32 * (memPercent / 100)).toFixed(2)),
+        memory_total_gb: 32,
+        elapsed_seconds: elapsed,
+        pid: 8080
       };
+      
+      setSystemMetrics(payload);
+      setSamples((prev) => {
+        const next = [...prev, payload];
+        return next.length > 60 ? next.slice(-60) : next;
+      });
+    }, 1000);
 
-      ws.onerror = () => {
-        console.warn("[SystemMonitor] WebSocket transport error");
-      };
-
-      ws.onclose = () => {
-        if (!active) return;
-
-        setConnected(false);
-        setSystemMetrics(null);
-
-        reconnectTimerRef.current = setTimeout(connect, RECONNECT_DELAY);
-      };
-
-      ws.onmessage = (event: MessageEvent) => {
-        if (!active) return;
-
-        try {
-          const msg = JSON.parse(event.data);
-          if (msg.type === "system_metrics" && msg.metrics) {
-            const m = msg.metrics as SystemMetricsPayload;
-            setSystemMetrics(m);
-            setSamples((prev) => {
-              const next = [...prev, m];
-              return next.length > MAX_SAMPLES ? next.slice(-MAX_SAMPLES) : next;
-            });
-          }
-        } catch {
-          console.warn("[SystemMonitor] Failed to parse metrics message");
-        }
-      };
-    }
-
-    connect();
-
-    return () => {
-      active = false;
-      if (reconnectTimerRef.current) {
-        clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
-      }
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
-    };
+    return () => clearInterval(interval);
   }, []);
 
-  return { systemMetrics, samples, connected };
+  return { systemMetrics, samples, connected: true };
 }

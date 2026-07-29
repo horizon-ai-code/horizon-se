@@ -1,6 +1,34 @@
 import type { OrchestrationResult } from "@/types/session";
 
-export const INITIAL_SOURCE = ``;
+export const INITIAL_SOURCE = `public class OrderProcessor {
+    private List<Order> orders;
+
+    public void processOrders() {
+        for (Order order : orders) {
+            if (order != null) {
+                if (order.isPending()) {
+                    if (order.hasValidAmount()) {
+                        if (order.getCustomer().isActive()) {
+                            order.process();
+                            sendNotification(order);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private void sendNotification(Order order) {
+        if (order.getCustomer() != null) {
+            if (order.getCustomer().getEmail() != null) {
+                if (!order.getCustomer().getEmail().isEmpty()) {
+                    emailService.send(order.getCustomer().getEmail(),
+                            "Your order is being processed");
+                }
+            }
+        }
+    }
+}`;
 
 export const EMPTY_ORCHESTRATION_RESULT: OrchestrationResult = {
   metrics: [],

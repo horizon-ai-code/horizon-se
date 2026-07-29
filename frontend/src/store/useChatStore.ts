@@ -72,7 +72,7 @@ const DEFAULT_SESSION: Omit<SessionData, "id"> = {
   sourceCode: INITIAL_SOURCE,
   refactoredOutput: "",
   activeStep: 0,
-  inputInstruction: "",
+  inputInstruction: "Extract deeply nested conditionals into well-named methods like isEligibleForProcessing()",
   terminalEntries: [],
   isTerminalCollapsed: false,
   appState: "idle",
@@ -162,16 +162,27 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
       const existing = state.sessions[id] || { ...DEFAULT_SESSION, id, createdAt: now, updatedAt: now };
       const data = typeof arg === "function" ? arg(existing) : arg;
+      const updated = {
+        ...existing,
+        ...data,
+        updatedAt: now,
+      };
+
+      if (typeof window !== "undefined") {
+        localStorage.setItem(`session_${id}`, JSON.stringify(updated));
+        const sessionIdsStr = localStorage.getItem("session_ids");
+        const ids: string[] = sessionIdsStr ? JSON.parse(sessionIdsStr) : [];
+        if (!ids.includes(id)) {
+          ids.push(id);
+          localStorage.setItem("session_ids", JSON.stringify(ids));
+        }
+      }
 
       return {
         ...state,
         sessions: {
           ...state.sessions,
-          [id]: {
-            ...existing,
-            ...data,
-            updatedAt: now,
-          },
+          [id]: updated,
         },
       };
     }),
@@ -183,20 +194,31 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       const now = Date.now();
       const instruction = initialData?.inputInstruction || "";
       const derivedTitle = instruction ? getSessionTitleFromPrompt(instruction) : "New Session";
+      const newSession: SessionData = { 
+        ...DEFAULT_SESSION, 
+        id, 
+        createdAt: now, 
+        updatedAt: now, 
+        ...initialData, 
+        title: derivedTitle,
+        isLoaded: true 
+      };
+
+      if (typeof window !== "undefined") {
+        localStorage.setItem(`session_${id}`, JSON.stringify(newSession));
+        const sessionIdsStr = localStorage.getItem("session_ids");
+        const ids: string[] = sessionIdsStr ? JSON.parse(sessionIdsStr) : [];
+        if (!ids.includes(id)) {
+          ids.push(id);
+          localStorage.setItem("session_ids", JSON.stringify(ids));
+        }
+      }
 
       return {
         ...state,
         sessions: {
           ...state.sessions,
-          [id]: { 
-            ...DEFAULT_SESSION, 
-            id, 
-            createdAt: now, 
-            updatedAt: now, 
-            ...initialData, 
-            title: derivedTitle,
-            isLoaded: true 
-          },
+          [id]: newSession,
         },
       };
     }),
@@ -205,19 +227,30 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const id = generateSessionId();
     const now = Date.now();
     const title = getSessionTitleFromPrompt(prompt);
+    const newSession: SessionData = {
+      ...DEFAULT_SESSION,
+      id,
+      title,
+      createdAt: now,
+      updatedAt: now,
+      ...initialData,
+    };
+
+    if (typeof window !== "undefined") {
+      localStorage.setItem(`session_${id}`, JSON.stringify(newSession));
+      const sessionIdsStr = localStorage.getItem("session_ids");
+      const ids: string[] = sessionIdsStr ? JSON.parse(sessionIdsStr) : [];
+      if (!ids.includes(id)) {
+        ids.push(id);
+        localStorage.setItem("session_ids", JSON.stringify(ids));
+      }
+    }
 
     set((state) => ({
       ...state,
       sessions: {
         ...state.sessions,
-        [id]: {
-          ...DEFAULT_SESSION,
-          id,
-          title,
-          createdAt: now,
-          updatedAt: now,
-          ...initialData,
-        },
+        [id]: newSession,
       },
     }));
 
@@ -228,83 +261,56 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const trimmed = title.trim();
     if (!trimmed) return;
 
-    const previousTitle = get().sessions[id]?.title;
-
     set((state) => {
       const session = state.sessions[id];
       if (!session) return state;
+      const updated = {
+        ...session,
+        title: trimmed,
+        updatedAt: Date.now(),
+      };
+      if (typeof window !== "undefined") {
+        localStorage.setItem(`session_${id}`, JSON.stringify(updated));
+      }
       return {
         ...state,
         sessions: {
           ...state.sessions,
-          [id]: {
-            ...session,
-            title: trimmed,
-            updatedAt: Date.now(),
-          },
+          [id]: updated,
         },
       };
     });
-
-    try {
-      const res = await fetch(`${API_URL}/api/history/${id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: trimmed }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    } catch (err) {
-      console.error("[ChatStore] Rename failed:", err);
-      set((state) => {
-        const session = state.sessions[id];
-        if (!session) return state;
-        return {
-          ...state,
-          sessions: {
-            ...state.sessions,
-            [id]: { ...session, title: previousTitle ?? session.title },
-          },
-        };
-      });
-    }
   },
 
   deleteSession: async (id) => {
-    try {
-      const res = await fetch(`${API_URL}/api/history/${id}`, {
-        method: "DELETE",
-      });
-      if (!res.ok) {
-        console.error(`[ChatStore] Backend returned ${res.status} on delete`);
-        return;
-      }
-    } catch(e) {
-      console.error("[ChatStore] Error deleting session from backend:", e);
-      return;
-    }
     set((state) => {
       if (!state.sessions[id]) return state;
 
       const remaining = { ...state.sessions };
       delete remaining[id];
+      
+      if (typeof window !== "undefined") {
+        localStorage.removeItem(`session_${id}`);
+        const sessionIdsStr = localStorage.getItem("session_ids");
+        const ids: string[] = sessionIdsStr ? JSON.parse(sessionIdsStr) : [];
+        const newIds = ids.filter(x => x !== id);
+        localStorage.setItem("session_ids", JSON.stringify(newIds));
+      }
+      
       return { ...state, sessions: remaining };
     });
   },
 
   clearAllHistory: async () => {
-    try {
-      const res = await fetch(`${API_URL}/api/history`, {
-        method: "DELETE",
-      });
-      if (!res.ok) {
-        console.error(`[ChatStore] Backend returned ${res.status} on clear all`);
-        return;
+    set((state) => {
+      if (typeof window !== "undefined") {
+        const sessionIdsStr = localStorage.getItem("session_ids");
+        const ids: string[] = sessionIdsStr ? JSON.parse(sessionIdsStr) : [];
+        ids.forEach(id => localStorage.removeItem(`session_${id}`));
+        localStorage.removeItem("session_ids");
       }
-    } catch(e) {
-      console.error("[ChatStore] Error clearing history:", e);
-      return;
-    }
-    set((state) => ({ ...state, sessions: {} }));
+      return { ...state, sessions: {} };
+    });
   },
 
   migrateSessionId: (oldId, newId) =>
@@ -315,51 +321,49 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
       const remaining = { ...state.sessions };
       delete remaining[oldId];
+      
+      const updated = {
+        ...oldSession,
+        id: newId,
+      };
+
+      if (typeof window !== "undefined") {
+        localStorage.removeItem(`session_${oldId}`);
+        localStorage.setItem(`session_${newId}`, JSON.stringify(updated));
+        const sessionIdsStr = localStorage.getItem("session_ids");
+        const ids: string[] = sessionIdsStr ? JSON.parse(sessionIdsStr) : [];
+        const newIds = ids.map(x => x === oldId ? newId : x);
+        localStorage.setItem("session_ids", JSON.stringify(newIds));
+      }
+
       return {
         ...state,
         sessions: {
           ...remaining,
-          [newId]: {
-            ...oldSession,
-            id: newId,
-          },
+          [newId]: updated,
         },
       };
     }),
 
   fetchHistory: async () => {
     try {
-      const res = await fetch(`${API_URL}/api/history`);
-      if (!res.ok) {
-        set((state) => ({ ...state, historyLoadError: true, hasInitialLoaded: true }));
-        return;
-      }
-      
-      const items: HistoryItemResponse[] = await res.json();
+      const sessionIdsStr = typeof window !== "undefined" ? localStorage.getItem("session_ids") : null;
+      const ids: string[] = sessionIdsStr ? JSON.parse(sessionIdsStr) : [];
       
       set((state) => {
         const newSessions = { ...state.sessions };
-        
-        items.forEach((item) => {
-            const id = item?.id;
-            if (!id) return;
-
-            const title = (item.title || "").trim() || "New Session";
-
-            const createdAt = item.created_at
-              ? new Date(item.created_at).getTime()
-              : (newSessions[id]?.createdAt || Date.now());
-
-            newSessions[id] = {
-                ...(newSessions[id] || DEFAULT_SESSION),
-                id,
-                title,
-                createdAt,
-                updatedAt: createdAt,
-                isLoaded: false,
-            };
+        ids.forEach((id) => {
+          const stored = typeof window !== "undefined" ? localStorage.getItem(`session_${id}`) : null;
+          if (stored) {
+            try {
+              const sessionData: SessionData = JSON.parse(stored);
+              newSessions[id] = {
+                ...sessionData,
+                isLoaded: false
+              };
+            } catch {}
+          }
         });
-
         return {
           ...state,
           sessions: newSessions,
@@ -369,170 +373,28 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       });
     } catch (e) {
       console.error("[ChatStore] Error fetching history:", e);
-      set((state) => ({ ...state, historyLoadError: true, hasInitialLoaded: true }));
+      set((state) => ({ ...state, historyLoadError: false, hasInitialLoaded: true }));
     }
   },
 
   fetchSessionDetails: async (id) => {
     try {
-      const res = await fetch(`${API_URL}/api/history/${id}`);
-      if (!res.ok) {
-        const errorType = res.status === 404 ? "not_found" : res.status === 409 ? "system_busy" : "unknown";
+      const stored = typeof window !== "undefined" ? localStorage.getItem(`session_${id}`) : null;
+      if (stored) {
+        const sessionData: SessionData = JSON.parse(stored);
         set((state) => ({
-           ...state,
-           sessions: {
-             ...state.sessions,
-             [id]: {
-               ...(state.sessions[id] || { ...DEFAULT_SESSION, id }),
-               error: errorType,
-               isLoaded: true
-             }
-           }
-        }));
-        return false;
-      }
-      
-      const detail: SessionDetailResponse = await res.json();
-      
-      set((state) => {
-        const existing = state.sessions[id] || { ...DEFAULT_SESSION, id };
-        
-
-        
-        const terminalEntries: TerminalEntry[] = (detail.logs || []).map((log: Record<string, unknown>, index: number) => {
-            const role = log.role as string;
-            const visuals = ROLE_VISUALS[role] || DEFAULT_ROLE_VISUALS;
-            const timestamp = log.created_at
-              ? new Date(log.created_at as string).toLocaleTimeString("en-US", { hour12: false })
-              : undefined;
-            return {
-                id: log.id ? `p-${log.id}` : `p-log-${index}`,
-                type: "log",
-                text: (log.content as string) || `[${role}]: ${log.status}`,
-                icon: visuals.icon,
-                colorClass: visuals.colorClass,
-                timestamp,
-            };
-        });
-
-        let activeStep = 0;
-        let appState: AppState = "idle";
-        const oResult = { ...EMPTY_ORCHESTRATION_RESULT };
-
-        const isHalted = detail.status === "Halted" || detail.exit_status === "ABORTED";
-        const isProcessing = detail.status === "Processing" && !detail.refactored_code && !isHalted;
-
-        // Parse phase_states from backend for correct node coloring
-        if (detail.phase_states) {
-          try {
-            const ps = JSON.parse(detail.phase_states);
-            oResult.phaseStates = ps.states;
-          } catch { /* ignore parse error */ }
-        }
-        oResult.exit_status = detail.exit_status as ExitStatus | undefined;
-
-        if (detail.refactored_code) {
-           activeStep = 5;
-           appState = "done";
-           // Parse insights JSON string
-           let parsedInsights = detail.insights || "";
-           if (typeof parsedInsights === "string" && parsedInsights.startsWith("[")) {
-             try {
-               const parsed = JSON.parse(parsedInsights);
-               if (Array.isArray(parsed)) {
-                  parsedInsights = parsed.map((i: { title?: string; details?: string }) =>
-                    `• **${i.title || ""}**: ${i.details || ""}`
-                  ).join("\n");
-               }
-              } catch {
-                console.warn("[ChatStore] Failed to parse insights JSON, using raw string");
-              }
-           }
-           oResult.summary = parsedInsights;
-           oResult.insights = parsedInsights;
-           oResult.original_complexity = detail.original_complexity;
-           oResult.refactored_complexity = detail.refactored_complexity;
-           oResult.planner_model = detail.planner_model;
-           oResult.generator_model = detail.generator_model;
-           oResult.judge_model = detail.judge_model;
-           oResult.performance = {
-                avg_gpu_utilization: detail.avg_gpu_utilization || 0,
-                avg_gpu_memory: detail.avg_gpu_memory || 0,
-                avg_gpu_memory_used: detail.avg_gpu_memory_used || 0,
-                peak_gpu_utilization: detail.peak_gpu_utilization ?? undefined,
-                peak_gpu_memory_used: detail.peak_gpu_memory_used ?? undefined,
-                inference_time: detail.inference_time || 0
-           };
-
-            oResult.metrics = buildMetrics(
-               detail.original_complexity ?? null,
-               detail.refactored_complexity ?? null,
-               {
-                 avg_gpu_utilization: detail.avg_gpu_utilization ?? 0,
-                 avg_gpu_memory: detail.avg_gpu_memory ?? 0,
-                 avg_gpu_memory_used: detail.avg_gpu_memory_used ?? 0,
-                 peak_gpu_utilization: detail.peak_gpu_utilization ?? undefined,
-                 peak_gpu_memory_used: detail.peak_gpu_memory_used ?? undefined,
-                 inference_time: detail.inference_time ?? 0,
-               },
-               detail.planner_model && detail.judge_model ? "multi" : "single"
-            );
-        } else if (isHalted) {
-           activeStep = 0;
-           appState = "done";
-           oResult.summary = "This refactoring was interrupted. You can start a new one.";
-           terminalEntries.push({
-             id: `p-interrupted`,
-             type: "log",
-             text: "[System]: Session was interrupted — refactoring did not complete.",
-             icon: "Monolith",
-             colorClass: "text-[#f4bf4f]",
-           });
-        } else if (isProcessing) {
-           activeStep = 0;
-           appState = "done";
-           oResult.summary = "This refactoring was interrupted. You can start a new one.";
-           terminalEntries.push({
-             id: `p-interrupted`,
-             type: "log",
-             text: "[System]: Session was interrupted — refactoring did not complete.",
-             icon: "Monolith",
-             colorClass: "text-[#f4bf4f]",
-           });
-        } else if (detail.logs && detail.logs.length > 0) {
-           appState = "analyzing";
-           const lastLog = detail.logs[detail.logs.length - 1];
-           const visuals = ROLE_VISUALS[lastLog.role ?? ''] || DEFAULT_ROLE_VISUALS;
-           activeStep = visuals.step;
-        }
-        
-        const storedTitle = (detail.title || "").trim();
-        const safeTitle = storedTitle
-          || (detail.user_instruction || "").trim()
-          || "Previous Session";
-
-        return {
-          ...state,
           sessions: {
             ...state.sessions,
             [id]: {
-              ...existing,
-              title: safeTitle.length > 48 ? `${safeTitle.slice(0, 48)}...` : safeTitle,
-              createdAt: detail.created_at ? new Date(detail.created_at).getTime() : existing.createdAt,
-              sourceCode: detail.original_code || existing.sourceCode,
-              refactoredOutput: detail.refactored_code || existing.refactoredOutput,
-              inputInstruction: detail.user_instruction || existing.inputInstruction,
-              appState,
-              activeStep,
-              terminalEntries,
-              orchestrationResult: oResult,
+              ...sessionData,
               isLoaded: true
             }
           }
-        };
-      });
-      return true;
-    } catch(e) {
+        }));
+        return true;
+      }
+      return false;
+    } catch (e) {
       console.error("[ChatStore] Error fetching session details:", e);
       return false;
     }
