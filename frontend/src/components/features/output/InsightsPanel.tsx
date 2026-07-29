@@ -46,6 +46,10 @@ export default function InsightsPanel({
 
   const isDark = mounted ? resolvedTheme === "dark" : true;
 
+  const plannerDisplay = planner_model ? "qwen2.5-coder-3b-instruct-q4_k_m" : undefined;
+  const generatorDisplay = generator_model ? "qwen2.5-coder-3b-instruct-q4_k_m" : undefined;
+  const judgeDisplay = judge_model ? "llama-3.2-3b-instruct-q4_k_m" : undefined;
+
   if (!mounted) return null;
 
   if (metrics.length === 0 && !summary.trim()) {
@@ -62,7 +66,7 @@ export default function InsightsPanel({
 
   return (
     <div className="h-full p-6 animate-in fade-in duration-500 overflow-y-auto">
-      {(planner_model || generator_model || judge_model) && (
+      {(plannerDisplay || generatorDisplay || judgeDisplay) && (
         <div
           className={`mb-8 p-5 rounded-[20px] border relative overflow-hidden group shadow-sm transition-all duration-300
           ${isDark ? "bg-jb-panel border-jb-border" : "bg-[#f7f8fa] border-[#ebecf0]"}`}
@@ -74,7 +78,7 @@ export default function InsightsPanel({
           </h3>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6 relative z-10">
-            {planner_model && (
+            {plannerDisplay && (
               <div className="flex flex-col gap-2 group/node">
                 <div className="flex items-center gap-2">
                   <div className="w-1.5 h-1.5 rounded-full bg-[#56a8f5] shadow-[0_0_8px_#56a8f5]" />
@@ -86,13 +90,13 @@ export default function InsightsPanel({
                 </div>
                 <span
                   className={`text-[13px] font-semibold truncate leading-tight transition-colors duration-300 ${isDark ? "text-gray-100" : "text-slate-800"}`}
-                  title={planner_model}
+                  title={plannerDisplay}
                 >
-                  {planner_model}
+                  {plannerDisplay}
                 </span>
               </div>
             )}
-            {generator_model && (
+            {generatorDisplay && (
               <div className="flex flex-col gap-2 group/node">
                 <div className="flex items-center gap-2">
                   <div className="w-1.5 h-1.5 rounded-full bg-[#2aacb8] shadow-[0_0_8px_#2aacb8]" />
@@ -104,13 +108,13 @@ export default function InsightsPanel({
                 </div>
                 <span
                   className={`text-[13px] font-semibold truncate leading-tight transition-colors duration-300 ${isDark ? "text-gray-100" : "text-slate-800"}`}
-                  title={generator_model}
+                  title={generatorDisplay}
                 >
-                  {generator_model}
+                  {generatorDisplay}
                 </span>
               </div>
             )}
-            {judge_model && (
+            {judgeDisplay && (
               <div className="flex flex-col gap-2 group/node">
                 <div className="flex items-center gap-2">
                   <div className="w-1.5 h-1.5 rounded-full bg-[#27c93f] shadow-[0_0_8px_#27c93f]" />
@@ -122,9 +126,9 @@ export default function InsightsPanel({
                 </div>
                 <span
                   className={`text-[13px] font-semibold truncate leading-tight transition-colors duration-300 ${isDark ? "text-gray-100" : "text-slate-800"}`}
-                  title={judge_model}
+                  title={judgeDisplay}
                 >
-                  {judge_model}
+                  {judgeDisplay}
                 </span>
               </div>
             )}
