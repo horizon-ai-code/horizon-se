@@ -49,6 +49,14 @@ orchestration_lock = asyncio.Lock()
 # killed alongside the connection. Bounded by EXECUTION_TIMEOUT_SECONDS.
 active_run_tasks: set[asyncio.Task] = set()
 
+# NFR: queue wait and true per-session execution bounds.
+LOCK_WAIT_TIMEOUT_SECONDS = int(os.getenv("LOCK_WAIT_TIMEOUT_SECONDS", "30"))
+EXECUTION_TIMEOUT_SECONDS = int(os.getenv("EXECUTION_TIMEOUT_MINUTES", "10")) * 60
+_TIMEOUT_MESSAGE = (
+    "Execution timed out after 10 minutes. The run was halted and your original code preserved."
+)
+_QUEUE_BUSY_MESSAGE = "System busy: your request waited too long in the queue. Please try again shortly."
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -142,40 +150,6 @@ async def entrypoint(websocket: WebSocket) -> None:
         websocket=websocket
     )
     await client_conn.start_heartbeat()
-
-    async def run_orchestration(client, validated_data: RefactorRequest):
-        try:
-            try:
-                await asyncio.wait_for(orchestration_lock.acquire(), timeout=600)
-            except asyncio.TimeoutError:
-                await client.send_status(
-                    Role.System,
-                    "Orchestration timed out after 10 minutes.",
-                )
-                return
-            try:
-                client.reset_id()
-                await client.send_connection_id()
-                await orchestrator.execute_orchestration(
-                    client=client,
-                    user_code=validated_data.code,
-                    user_instruction=validated_data.user_instruction,
-                )
-            finally:
-                orchestration_lock.release()
-        except (asyncio.CancelledError, InterruptedError):
-            connection.db.mark_as_halted(client.id)
-            await client.send_halt_notification()
-            raise
-        except Exception as e:
-            print(f"Orchestration Task Failure (ID: {client.id}): {e}")
-            try:
-                await client.send_status(
-                    Role.System,
-                    f"Orchestration failed: {str(e)[:200]}",
-                )
-            except Exception:
-                pass
 
     try:
         while True:
@@ -292,17 +266,87 @@ async def _handle_reconnect(session_id: str, client_conn: ClientConnection) -> N
         await client_conn.websocket.send_json({"type": "error", "code": "UNKNOWN_SESSION_STATUS", "message": f"Unknown session status: {status}"})
 
 
+async def run_orchestration(client: ClientConnection, validated_data: RefactorRequest) -> None:
+    """Acquire the orchestration lock and run one multi-agent refactor.
+
+    NFR: the lock acquisition wait is bounded by LOCK_WAIT_TIMEOUT_SECONDS and
+    true execution by EXECUTION_TIMEOUT_SECONDS (SRS 10-minute session cap).
+    On execution timeout the session is marked Halted and the user informed.
+    """
+    try:
+        try:
+            await asyncio.wait_for(
+                orchestration_lock.acquire(), timeout=LOCK_WAIT_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            await client.send_status(Role.System, _QUEUE_BUSY_MESSAGE)
+            return
+        try:
+            client.reset_id()
+            await client.send_connection_id()
+            await asyncio.wait_for(
+                orchestrator.execute_orchestration(
+                    client=client,
+                    user_code=validated_data.code,
+                    user_instruction=validated_data.user_instruction,
+                ),
+                timeout=EXECUTION_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            connection.db.mark_as_halted(client.id)
+            try:
+                await client.send_status(Role.System, _TIMEOUT_MESSAGE)
+            except Exception:
+                pass
+        finally:
+            orchestration_lock.release()
+    except (asyncio.CancelledError, InterruptedError):
+        connection.db.mark_as_halted(client.id)
+        await client.send_halt_notification()
+        raise
+    except Exception as e:
+        print(f"Orchestration Task Failure (ID: {client.id}): {e}")
+        try:
+            await client.send_status(
+                Role.System,
+                f"Orchestration failed: {str(e)[:200]}",
+            )
+        except Exception:
+            pass
+
+
 async def run_single_refactor(
     client: ClientConnection,
     user_code: str,
     user_instruction: str,
 ) -> None:
-    """Thin wrapper — delegates to Orchestrator.run_single_refactor() inside the lock."""
+    """Thin wrapper — delegates to Orchestrator.run_single_refactor() inside the lock.
+
+    NFR: same bounded queue wait and true execution timeout as the multi path.
+    """
     try:
-        async with orchestration_lock:
+        try:
+            await asyncio.wait_for(
+                orchestration_lock.acquire(), timeout=LOCK_WAIT_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            await client.send_status(Role.System, _QUEUE_BUSY_MESSAGE)
+            return
+        try:
             client.reset_id()
             await client.send_connection_id()
-            await orchestrator.run_single_refactor(client, user_code, user_instruction)
+            await asyncio.wait_for(
+                orchestrator.run_single_refactor(client, user_code, user_instruction),
+                timeout=EXECUTION_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            connection.db.mark_as_halted(client.id)
+            try:
+                await client.send_status(Role.System, _TIMEOUT_MESSAGE)
+            except Exception:
+                pass
+        finally:
+            orchestration_lock.release()
 
     except (asyncio.CancelledError, InterruptedError):
         connection.db.mark_as_halted(client.id)
