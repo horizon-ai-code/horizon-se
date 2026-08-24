@@ -43,6 +43,16 @@ class TestClientConnection:
         client._missed_pongs = 1
         assert client.is_stale is False
 
+    @pytest.mark.asyncio
+    async def test_safe_send_swallows_runtime_error(self, client):  # TC-CC-009
+        client.websocket.send_json = AsyncMock(side_effect=RuntimeError("Cannot call send once closed"))
+        await client._safe_send({"type": "status"})  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_safe_send_swallows_os_error(self, client):  # TC-CC-010
+        client.websocket.send_json = AsyncMock(side_effect=OSError("connection reset"))
+        await client._safe_send({"type": "status"})  # must not raise
+
     def test_handle_pong_resets_counter(self, client):  # TC-CC-005
         client._missed_pongs = 1
         client.handle_pong()
