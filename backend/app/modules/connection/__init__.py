@@ -61,10 +61,15 @@ class ClientConnection:
         self._missed_pongs = 0
 
     async def _safe_send(self, message: dict) -> None:
-        """Send JSON to frontend, silently handling disconnect."""
+        """Send JSON to frontend, silently handling disconnect.
+
+        Catches WebSocketDisconnect plus RuntimeError/OSError raised when
+        sending on an already-closed socket so that runs surviving a client
+        disconnect (FR-011 resilient runs) are never crashed by a notification.
+        """
         try:
             await self.websocket.send_json(message)
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, RuntimeError, OSError):
             pass
 
     def reset_id(self) -> None:

@@ -48,6 +48,7 @@ export interface OrchestrationContextValue {
   sendRefactorRequest: (request: RefactorRequest, commandId?: string) => boolean;
   sendSingleRefactor: (code: string, instruction: string) => boolean;
   sendHaltRequest: () => boolean;
+  reattach: (sessionId: string) => Promise<boolean>;
   setTargetSessionId: (id: string) => void;
   glassboxState: GlassboxState;
   waitForOpen: () => Promise<boolean>;
@@ -62,6 +63,9 @@ export function OrchestrationProvider({ children }: { children: ReactNode }) {
   const backoffRef = useRef(INITIAL_BACKOFF_MS);
   const intentionalCloseRef = useRef(false);
   const sessionIdRef = useRef<string | null>(null);
+  // FR-011 resilient runs: session whose run we started or reattached to.
+  // Drives resume-on-reopen after unexpected socket drops.
+  const runActiveSessionRef = useRef<string | null>(null);
   const lastProcessedCommandIdRef = useRef<string | null>(null);
   const messageBufferRef = useRef<ServerMessage[]>([]);
   const routerRef = useRef(router);
@@ -180,6 +184,10 @@ export function OrchestrationProvider({ children }: { children: ReactNode }) {
             appState = "waiting";
           } else if (msg.content.toLowerCase().includes("halted")) {
             appState = "idle";
+          } else if (msg.content.toLowerCase().includes("reconnected to ongoing session")) {
+            // FR-011: live reattach — treat as run-in-progress so the panel
+            // switches to the Flow diagram immediately.
+            appState = "analyzing";
           }
         } else if (appState === "waiting" || appState === "idle") {
           // Transition to analyzing when we get the first agent message
@@ -595,14 +603,14 @@ export function OrchestrationProvider({ children }: { children: ReactNode }) {
       // Reset command tracking on fresh connection to allow re-sending if needed
       lastProcessedCommandIdRef.current = null;
 
-      // Attempt to reconnect to previous session
+      // FR-011 resilient runs: if a run was started (or reattached) under a
+      // previous socket instance and that socket dropped unexpectedly, ask
+      // the server to reattach us to it. Plain navigation never triggers
+      // this — runActiveSessionRef is only set on send/reattach.
       try {
-        const lastSessionId = typeof window !== "undefined"
-          ? localStorage.getItem("lastSessionId")
-          : null;
-        if (lastSessionId && sessionIdRef.current === null) {
-          sessionIdRef.current = lastSessionId;
-          ws.send(JSON.stringify({ type: "reconnect", session_id: lastSessionId }));
+        const resumeId = runActiveSessionRef.current;
+        if (resumeId && sessionIdRef.current === resumeId && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "reconnect", session_id: resumeId }));
         }
       } catch (err) {
         console.warn("[WS] Failed to send reconnect message:", err);
@@ -678,12 +686,14 @@ export function OrchestrationProvider({ children }: { children: ReactNode }) {
             handleStatusRef.current(msg, targetId);
             break;
           case "result":
+            runActiveSessionRef.current = null;
             handleResultRef.current(msg, targetId);
             break;
           case "insights":
             handleInsightsRef.current(msg, targetId);
             break;
           case "halt_acknowledged":
+            runActiveSessionRef.current = null;
             handleHaltAckRef.current(targetId);
             break;
           case "error":
@@ -791,6 +801,7 @@ export function OrchestrationProvider({ children }: { children: ReactNode }) {
       if (commandId) {
         lastProcessedCommandIdRef.current = commandId;
       }
+      runActiveSessionRef.current = sessionIdRef.current;
       return true;
     },
     []
@@ -823,6 +834,7 @@ export function OrchestrationProvider({ children }: { children: ReactNode }) {
           code,
           user_instruction: instruction,
         }));
+        runActiveSessionRef.current = sessionIdRef.current;
         return true;
       } catch (err) {
         console.error("[WS] Failed to send single refactor:", err);
@@ -853,6 +865,22 @@ export function OrchestrationProvider({ children }: { children: ReactNode }) {
     });
   }, []);
 
+  // ── FR-011 resilient runs ────────────────────────────────────────────────
+
+  const reattach = useCallback(async (sessionId: string): Promise<boolean> => {
+    connect(sessionId);
+    const ok = await waitForOpen();
+    if (!ok || wsRef.current?.readyState !== WebSocket.OPEN) return false;
+    runActiveSessionRef.current = sessionId;
+    try {
+      wsRef.current.send(JSON.stringify({ type: "reconnect", session_id: sessionId }));
+      return true;
+    } catch (err) {
+      console.warn("[WS] Failed to send reconnect message:", err);
+      return false;
+    }
+  }, [connect, waitForOpen]);
+
   // ── Cleanup on unmount ───────────────────────────────────────────────────
 
   useEffect(() => {
@@ -875,6 +903,7 @@ export function OrchestrationProvider({ children }: { children: ReactNode }) {
         sendRefactorRequest,
         sendSingleRefactor,
         sendHaltRequest,
+        reattach,
         setTargetSessionId,
         glassboxState,
         waitForOpen,

@@ -49,4 +49,6 @@ export interface SessionData {
   isLoaded?: boolean;
   error?: string;
   errorCode?: string;
+  /** Last known backend lifecycle status for this session (FR-011). */
+  serverStatus?: "Processing" | "Completed" | "Halted" | "Zombie" | string;
 }

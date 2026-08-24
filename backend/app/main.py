@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -43,6 +44,19 @@ system_monitor: SystemMonitor = SystemMonitor()
 # Global lock to serialize all orchestration (model & DB) operations
 orchestration_lock = asyncio.Lock()
 
+# FR-011 resilient runs: live orchestration tasks are tracked process-wide so
+# they survive websocket disconnects (browser refresh/close) instead of being
+# killed alongside the connection. Bounded by EXECUTION_TIMEOUT_SECONDS.
+active_run_tasks: set[asyncio.Task] = set()
+
+# NFR: queue wait and true per-session execution bounds.
+LOCK_WAIT_TIMEOUT_SECONDS = int(os.getenv("LOCK_WAIT_TIMEOUT_SECONDS", "30"))
+EXECUTION_TIMEOUT_SECONDS = int(os.getenv("EXECUTION_TIMEOUT_MINUTES", "10")) * 60
+_TIMEOUT_MESSAGE = (
+    "Execution timed out after 10 minutes. The run was halted and your original code preserved."
+)
+_QUEUE_BUSY_MESSAGE = "System busy: your request waited too long in the queue. Please try again shortly."
+
 # FR-017: recurring session cleanup cadence (zombie flagging + halted purge)
 CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_MINUTES", "15")) * 60
 
@@ -72,6 +86,14 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # FR-011 resilient runs: cancel any still-running orchestrations so their
+    # CancelledError handlers persist a final (Halted) state before DB close.
+    if active_run_tasks:
+        for t in list(active_run_tasks):
+            t.cancel()
+        await asyncio.gather(*active_run_tasks, return_exceptions=True)
+
+    # FR-017: stop the recurring cleanup loop
     cleanup_task.cancel()
     try:
         await cleanup_task
@@ -143,41 +165,6 @@ async def entrypoint(websocket: WebSocket) -> None:
         websocket=websocket
     )
     await client_conn.start_heartbeat()
-    active_tasks: set[asyncio.Task] = set()
-
-    async def run_orchestration(client, validated_data: RefactorRequest):
-        try:
-            try:
-                await asyncio.wait_for(orchestration_lock.acquire(), timeout=600)
-            except asyncio.TimeoutError:
-                await client.send_status(
-                    Role.System,
-                    "Orchestration timed out after 10 minutes.",
-                )
-                return
-            try:
-                client.reset_id()
-                await client.send_connection_id()
-                await orchestrator.execute_orchestration(
-                    client=client,
-                    user_code=validated_data.code,
-                    user_instruction=validated_data.user_instruction,
-                )
-            finally:
-                orchestration_lock.release()
-        except (asyncio.CancelledError, InterruptedError):
-            connection.db.mark_as_halted(client.id)
-            await client.send_halt_notification()
-            raise
-        except Exception as e:
-            print(f"Orchestration Task Failure (ID: {client.id}): {e}")
-            try:
-                await client.send_status(
-                    Role.System,
-                    f"Orchestration failed: {str(e)[:200]}",
-                )
-            except Exception:
-                pass
 
     try:
         while True:
@@ -193,7 +180,7 @@ async def entrypoint(websocket: WebSocket) -> None:
                 await client_conn.send_status(Role.System, "System is busy. Your request has been queued and will start automatically.")
 
             handled = await router.dispatch(
-                data, client_conn, active_tasks,
+                data, client_conn, active_run_tasks,
                 run_single_refactor, run_orchestration,
                 reconnect_handler=_handle_reconnect,
             )
@@ -201,19 +188,14 @@ async def entrypoint(websocket: WebSocket) -> None:
                 continue
 
     except WebSocketDisconnect as e:
-        print(f"Connection disconnected: {e}")
-        agent_service.stop()
-        for task in active_tasks.copy():
-            if not task.done():
-                task.cancel()
+        # FR-011 resilient runs: the client is gone but any in-flight run
+        # keeps executing server-side; logs/results persist to the DB and
+        # the client can reattach later via {"type": "reconnect"}.
+        print(f"Client disconnected (run continues): {e}")
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:
         await client_conn.stop_heartbeat()
-        agent_service.stop()
-        for task in active_tasks.copy():
-            if not task.done():
-                task.cancel()
 
 
 @app.websocket("/ws/system")
@@ -231,53 +213,136 @@ async def system_monitor_ws(websocket: WebSocket) -> None:
         pass
 
 
-async def _handle_reconnect(session_id: str, ws: WebSocket) -> None:
-    """Handle frontend reconnection to an existing session."""
+async def _replay_persisted_result(record: dict, client_conn: ClientConnection) -> None:
+    """Replay the persisted outcome of a finished session over the live socket.
+
+    Used by reconnect branches whose run is no longer active — ensures the
+    client sees final output/metrics without a full page reload (FR-011).
+    """
+    await client_conn.send_result(
+        final_code=record.get("refactored_code", ""),
+        original_complexity=record.get("original_complexity"),
+        refactored_complexity=record.get("refactored_complexity"),
+        performance_metrics={
+            "avg_gpu_utilization": record.get("avg_gpu_utilization", 0),
+            "avg_gpu_memory": record.get("avg_gpu_memory", 0),
+            "avg_gpu_memory_used": record.get("avg_gpu_memory_used", 0),
+            "inference_time": record.get("inference_time", 0),
+        },
+        exit_status=record.get("exit_status", "UNKNOWN"),
+        planner_model=record.get("planner_model") or "",
+        generator_model=record.get("generator_model") or "",
+        judge_model=record.get("judge_model") or "",
+    )
+    insights = record.get("insights")
+    if insights:
+        await client_conn.send_insights(insights)
+
+
+async def _handle_reconnect(session_id: str, client_conn: ClientConnection) -> None:
+    """Handle frontend reconnection to an existing session (FR-011).
+
+    Reattachment is done IN PLACE: this socket's own ClientConnection is
+    promoted into orchestrator.current_client so heartbeat pongs keep
+    flowing to the very object the pipeline notifies through. Creating a
+    second connection object here would starve its heartbeat (~30s later
+    all sends get stale-suppressed).
+    """
     if not session_id:
-        await ws.send_json({"type": "error", "code": "MISSING_SESSION_ID", "message": "Missing session_id"})
+        await client_conn.websocket.send_json({"type": "error", "code": "MISSING_SESSION_ID", "message": "Missing session_id"})
+        return
+
+    try:
+        uuid.UUID(session_id)
+    except ValueError:
+        await client_conn.websocket.send_json({"type": "error", "code": "INVALID_SESSION_ID", "message": "session_id must be a UUID"})
         return
 
     record = await connection.get_history_by_id(session_id)
     if not record:
-        await ws.send_json({"type": "error", "code": "SESSION_NOT_FOUND", "message": "Session not found"})
+        await client_conn.websocket.send_json({"type": "error", "code": "SESSION_NOT_FOUND", "message": "Session not found"})
         return
 
-    new_conn = connection.create_websocket_connection(ws)
-    new_conn.id = session_id
-    await new_conn.start_heartbeat()
+    status = record.get("status")
 
-    if record.get("status") == "Completed":
-        await new_conn.send_result(
-            final_code=record.get("refactored_code", ""),
-            original_complexity=record.get("original_complexity"),
-            refactored_complexity=record.get("refactored_complexity"),
-            performance_metrics={
-                "avg_gpu_utilization": record.get("avg_gpu_utilization", 0),
-                "avg_gpu_memory": record.get("avg_gpu_memory", 0),
-                "avg_gpu_memory_used": record.get("avg_gpu_memory_used", 0),
-                "inference_time": record.get("inference_time", 0),
-            },
-            exit_status=record.get("exit_status", "UNKNOWN"),
-        )
-        insights = record.get("insights")
-        if insights:
-            await new_conn.send_insights(insights)
-        await new_conn.send_status(Role.System, "Session restored.")
-        await new_conn.stop_heartbeat()
-    elif record.get("status") in ("Processing", "Halted"):
-        if orchestrator.current_client is not None:
-            orchestrator.current_client = new_conn
-            await new_conn.send_status(
-                Role.System,
-                f"Reconnected to ongoing session. Status: {record.get('status')}",
-            )
+    if status == "Completed":
+        await _replay_persisted_result(record, client_conn)
+        await client_conn.send_status(Role.System, "Session restored.")
+
+    elif status == "Processing":
+        active = orchestrator.current_client
+        if active is not None and active.id == session_id:
+            # Live run for THIS session — reattach in place.
+            client_conn.id = session_id
+            orchestrator.current_client = client_conn
+            await client_conn.send_status(Role.System, "Reconnected to ongoing session.")
+        elif record.get("refactored_code"):
+            # Run finished (or finished-and-failed) after the client hydrated
+            # as Processing — replay the outcome so no reload is needed.
+            await _replay_persisted_result(record, client_conn)
+            await client_conn.send_status(Role.System, "Session restored.")
         else:
-            await new_conn.send_status(
+            await client_conn.send_status(
                 Role.System,
-                "Session lost due to server restart. Please start a new refactor.",
+                "Session is not active on the server (it may have been interrupted by a restart). Please start a new refactor.",
             )
+
+    elif status == "Halted":
+        if record.get("refactored_code"):
+            await _replay_persisted_result(record, client_conn)
+        await client_conn.send_status(Role.System, "This session was halted earlier. Start a new refactor to continue.")
+
     else:
-        await ws.send_json({"type": "error", "code": "UNKNOWN_SESSION_STATUS", "message": f"Unknown session status: {record.get('status')}"})
+        await client_conn.websocket.send_json({"type": "error", "code": "UNKNOWN_SESSION_STATUS", "message": f"Unknown session status: {status}"})
+
+
+async def run_orchestration(client: ClientConnection, validated_data: RefactorRequest) -> None:
+    """Acquire the orchestration lock and run one multi-agent refactor.
+
+    NFR: the lock acquisition wait is bounded by LOCK_WAIT_TIMEOUT_SECONDS and
+    true execution by EXECUTION_TIMEOUT_SECONDS (SRS 10-minute session cap).
+    On execution timeout the session is marked Halted and the user informed.
+    """
+    try:
+        try:
+            await asyncio.wait_for(
+                orchestration_lock.acquire(), timeout=LOCK_WAIT_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            await client.send_status(Role.System, _QUEUE_BUSY_MESSAGE)
+            return
+        try:
+            client.reset_id()
+            await client.send_connection_id()
+            await asyncio.wait_for(
+                orchestrator.execute_orchestration(
+                    client=client,
+                    user_code=validated_data.code,
+                    user_instruction=validated_data.user_instruction,
+                ),
+                timeout=EXECUTION_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            connection.db.mark_as_halted(client.id)
+            try:
+                await client.send_status(Role.System, _TIMEOUT_MESSAGE)
+            except Exception:
+                pass
+        finally:
+            orchestration_lock.release()
+    except (asyncio.CancelledError, InterruptedError):
+        connection.db.mark_as_halted(client.id)
+        await client.send_halt_notification()
+        raise
+    except Exception as e:
+        print(f"Orchestration Task Failure (ID: {client.id}): {e}")
+        try:
+            await client.send_status(
+                Role.System,
+                f"Orchestration failed: {str(e)[:200]}",
+            )
+        except Exception:
+            pass
 
 
 async def run_single_refactor(
@@ -285,12 +350,33 @@ async def run_single_refactor(
     user_code: str,
     user_instruction: str,
 ) -> None:
-    """Thin wrapper — delegates to Orchestrator.run_single_refactor() inside the lock."""
+    """Thin wrapper — delegates to Orchestrator.run_single_refactor() inside the lock.
+
+    NFR: same bounded queue wait and true execution timeout as the multi path.
+    """
     try:
-        async with orchestration_lock:
+        try:
+            await asyncio.wait_for(
+                orchestration_lock.acquire(), timeout=LOCK_WAIT_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            await client.send_status(Role.System, _QUEUE_BUSY_MESSAGE)
+            return
+        try:
             client.reset_id()
             await client.send_connection_id()
-            await orchestrator.run_single_refactor(client, user_code, user_instruction)
+            await asyncio.wait_for(
+                orchestrator.run_single_refactor(client, user_code, user_instruction),
+                timeout=EXECUTION_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            connection.db.mark_as_halted(client.id)
+            try:
+                await client.send_status(Role.System, _TIMEOUT_MESSAGE)
+            except Exception:
+                pass
+        finally:
+            orchestration_lock.release()
 
     except (asyncio.CancelledError, InterruptedError):
         connection.db.mark_as_halted(client.id)

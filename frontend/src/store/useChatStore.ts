@@ -289,6 +289,10 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       delete remaining[id];
       return { ...state, sessions: remaining };
     });
+    // FR-011: never leave a deleted session as the auto-reconnect target.
+    if (typeof window !== "undefined" && localStorage.getItem("lastSessionId") === id) {
+      localStorage.removeItem("lastSessionId");
+    }
   },
 
   clearAllHistory: async () => {
@@ -305,6 +309,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       return;
     }
     set((state) => ({ ...state, sessions: {} }));
+    if (typeof window !== "undefined") {
+      localStorage.removeItem("lastSessionId");
+    }
   },
 
   migrateSessionId: (oldId, newId) =>
@@ -488,18 +495,22 @@ export const useChatStore = create<ChatStore>((set, get) => ({
              icon: "Monolith",
              colorClass: "text-[#f4bf4f]",
            });
-        } else if (isProcessing) {
-           activeStep = 0;
-           appState = "done";
-           oResult.summary = "This refactoring was interrupted. You can start a new one.";
-           terminalEntries.push({
-             id: `p-interrupted`,
-             type: "log",
-             text: "[System]: Session was interrupted — refactoring did not complete.",
-             icon: "Monolith",
-             colorClass: "text-[#f4bf4f]",
-           });
-        } else if (detail.logs && detail.logs.length > 0) {
+         } else if (isProcessing) {
+           // FR-011 resilient runs: a Processing row may still be executing
+           // server-side. Hydrate optimistically; the reattach flow (if the
+           // session is live) will flip appState back to "analyzing" as soon
+           // as status messages start arriving.
+            activeStep = 0;
+            appState = "idle";
+            oResult.summary = "Refactoring is still running on the server — reconnecting to live output…";
+            terminalEntries.push({
+              id: `p-reconnecting`,
+              type: "log",
+              text: "[System]: Refactoring is still running on the server — reconnecting to live output…",
+              icon: "Monolith",
+              colorClass: "text-[#f4bf4f]",
+            });
+         } else if (detail.logs && detail.logs.length > 0) {
            appState = "analyzing";
            const lastLog = detail.logs[detail.logs.length - 1];
            const visuals = ROLE_VISUALS[lastLog.role ?? ''] || DEFAULT_ROLE_VISUALS;
@@ -526,6 +537,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
               activeStep,
               terminalEntries,
               orchestrationResult: oResult,
+              serverStatus: detail.status as SessionData["serverStatus"],
               isLoaded: true
             }
           }
