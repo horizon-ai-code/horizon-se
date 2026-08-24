@@ -98,4 +98,26 @@ describe("useOrchestrationSocket reconnect (FR-011)", () => {
       expect.objectContaining({ type: "reconnect" })
     );
   });
+
+  it("flips appState to analyzing on live-reattach confirmation", async () => {
+    const { useChatStore } = await import("@/store/useChatStore");
+    const { result } = renderSocket();
+
+    await act(async () => {
+      const p = result.current.reattach("session-live");
+      await flushTimers(60);
+      await p;
+    });
+
+    // Server confirms live reattach.
+    await act(async () => {
+      instances[instances.length - 1].receive("status", {
+        role: "System",
+        content: "Reconnected to ongoing session.",
+      });
+    });
+
+    const session = useChatStore.getState().sessions["session-live"];
+    expect(session?.appState).toBe("analyzing");
+  });
 });

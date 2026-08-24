@@ -71,6 +71,16 @@ export default function RefactoredOutput({
     }
   }, [appState, isMonolith]);
 
+  // FR-011: completion (live or via reconnect replay) always lands the user
+  // on the Refactored Output view — insights stay one click away.
+  const prevAppStateRef = useRef<AppState>(appState);
+  useEffect(() => {
+    if (appState === "done" && prevAppStateRef.current !== "done") {
+      requestAnimationFrame(() => setRightPanelMode("output"));
+    }
+    prevAppStateRef.current = appState;
+  }, [appState]);
+
   useEffect(() => {
     if (appState === "analyzing") {
       if (startTimeRef.current === null) startTimeRef.current = Date.now();

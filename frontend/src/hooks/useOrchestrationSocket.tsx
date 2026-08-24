@@ -184,6 +184,10 @@ export function OrchestrationProvider({ children }: { children: ReactNode }) {
             appState = "waiting";
           } else if (msg.content.toLowerCase().includes("halted")) {
             appState = "idle";
+          } else if (msg.content.toLowerCase().includes("reconnected to ongoing session")) {
+            // FR-011: live reattach — treat as run-in-progress so the panel
+            // switches to the Flow diagram immediately.
+            appState = "analyzing";
           }
         } else if (appState === "waiting" || appState === "idle") {
           // Transition to analyzing when we get the first agent message
