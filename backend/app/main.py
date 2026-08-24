@@ -198,6 +198,32 @@ async def system_monitor_ws(websocket: WebSocket) -> None:
         pass
 
 
+async def _replay_persisted_result(record: dict, client_conn: ClientConnection) -> None:
+    """Replay the persisted outcome of a finished session over the live socket.
+
+    Used by reconnect branches whose run is no longer active — ensures the
+    client sees final output/metrics without a full page reload (FR-011).
+    """
+    await client_conn.send_result(
+        final_code=record.get("refactored_code", ""),
+        original_complexity=record.get("original_complexity"),
+        refactored_complexity=record.get("refactored_complexity"),
+        performance_metrics={
+            "avg_gpu_utilization": record.get("avg_gpu_utilization", 0),
+            "avg_gpu_memory": record.get("avg_gpu_memory", 0),
+            "avg_gpu_memory_used": record.get("avg_gpu_memory_used", 0),
+            "inference_time": record.get("inference_time", 0),
+        },
+        exit_status=record.get("exit_status", "UNKNOWN"),
+        planner_model=record.get("planner_model") or "",
+        generator_model=record.get("generator_model") or "",
+        judge_model=record.get("judge_model") or "",
+    )
+    insights = record.get("insights")
+    if insights:
+        await client_conn.send_insights(insights)
+
+
 async def _handle_reconnect(session_id: str, client_conn: ClientConnection) -> None:
     """Handle frontend reconnection to an existing session (FR-011).
 
@@ -225,24 +251,7 @@ async def _handle_reconnect(session_id: str, client_conn: ClientConnection) -> N
     status = record.get("status")
 
     if status == "Completed":
-        await client_conn.send_result(
-            final_code=record.get("refactored_code", ""),
-            original_complexity=record.get("original_complexity"),
-            refactored_complexity=record.get("refactored_complexity"),
-            performance_metrics={
-                "avg_gpu_utilization": record.get("avg_gpu_utilization", 0),
-                "avg_gpu_memory": record.get("avg_gpu_memory", 0),
-                "avg_gpu_memory_used": record.get("avg_gpu_memory_used", 0),
-                "inference_time": record.get("inference_time", 0),
-            },
-            exit_status=record.get("exit_status", "UNKNOWN"),
-            planner_model=record.get("planner_model") or "",
-            generator_model=record.get("generator_model") or "",
-            judge_model=record.get("judge_model") or "",
-        )
-        insights = record.get("insights")
-        if insights:
-            await client_conn.send_insights(insights)
+        await _replay_persisted_result(record, client_conn)
         await client_conn.send_status(Role.System, "Session restored.")
 
     elif status == "Processing":
@@ -252,14 +261,20 @@ async def _handle_reconnect(session_id: str, client_conn: ClientConnection) -> N
             client_conn.id = session_id
             orchestrator.current_client = client_conn
             await client_conn.send_status(Role.System, "Reconnected to ongoing session.")
+        elif record.get("refactored_code"):
+            # Run finished (or finished-and-failed) after the client hydrated
+            # as Processing — replay the outcome so no reload is needed.
+            await _replay_persisted_result(record, client_conn)
+            await client_conn.send_status(Role.System, "Session restored.")
         else:
-            # Either no run is active or a different session owns the slot.
             await client_conn.send_status(
                 Role.System,
                 "Session is not active on the server (it may have been interrupted by a restart). Please start a new refactor.",
             )
 
     elif status == "Halted":
+        if record.get("refactored_code"):
+            await _replay_persisted_result(record, client_conn)
         await client_conn.send_status(Role.System, "This session was halted earlier. Start a new refactor to continue.")
 
     else:

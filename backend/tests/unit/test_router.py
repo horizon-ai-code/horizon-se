@@ -163,6 +163,43 @@ class TestHandleReconnect:
         await m._handle_reconnect(sid, conn)
         assert "halted" in str(conn.send_status.await_args).lower()
 
+    async def test_halted_with_code_replays_result(self, stub_main):  # TC-RN-008
+        """Halted sessions that produced output replay it — no reload needed."""
+        m, get = stub_main
+        sid = str(uuid.uuid4())
+        get.return_value = {
+            "status": "Halted",
+            "exit_status": "ABORTED",
+            "refactored_code": "class Partial {}",
+            "original_complexity": 5,
+            "refactored_complexity": None,
+        }
+        conn = _StubConn()
+        await m._handle_reconnect(sid, conn)
+
+        assert conn.send_result.await_args.kwargs["final_code"] == "class Partial {}"
+        assert "halted" in str(conn.send_status.await_args).lower()
+
+    async def test_processing_finished_after_hydrate_replays(self, stub_main):  # TC-RN-009
+        """Row said Processing at hydrate-time but run already finished with
+        output (no active run) → replay instead of dead-end notice."""
+        m, get = stub_main
+        sid = str(uuid.uuid4())
+        get.return_value = {
+            "status": "Processing",
+            "exit_status": "SUCCESS",
+            "refactored_code": "class Done {}",
+            "insights": "- done",
+        }
+        m.orchestrator.current_client = None
+
+        conn = _StubConn()
+        await m._handle_reconnect(sid, conn)
+
+        assert conn.send_result.await_args.kwargs["final_code"] == "class Done {}"
+        conn.send_insights.assert_awaited_once_with("- done")
+        assert "restored" in str(conn.send_status.await_args).lower()
+
     async def test_completed_replays_result_with_models_and_insights(self, stub_main):  # TC-RN-006
         m, get = stub_main
         sid = str(uuid.uuid4())
