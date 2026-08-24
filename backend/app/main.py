@@ -13,7 +13,7 @@ from pydantic import UUID4
 
 from app.modules.agent import AgentService, InterruptedError
 from app.modules.connection import ClientConnection, ConnectionManager, MessageRouter
-from app.modules.context import db
+from app.modules.context import db, periodic_history_cleanup
 from app.modules.orchestrator import Orchestrator
 from app.modules.validator import Validator
 from app.utils.schemas import (
@@ -57,6 +57,9 @@ _TIMEOUT_MESSAGE = (
 )
 _QUEUE_BUSY_MESSAGE = "System busy: your request waited too long in the queue. Please try again shortly."
 
+# FR-017: recurring session cleanup cadence (zombie flagging + halted purge)
+CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_MINUTES", "15")) * 60
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -75,6 +78,12 @@ async def lifespan(app: FastAPI):
     if deleted:
         print(f"Deleted {deleted} halted sessions")
     await system_monitor.start()
+
+    # FR-017: keep re-purging stale sessions for the lifetime of the process
+    cleanup_task = asyncio.create_task(
+        periodic_history_cleanup(connection.db, CLEANUP_INTERVAL_SECONDS)
+    )
+
     yield
 
     # FR-011 resilient runs: cancel any still-running orchestrations so their
@@ -84,6 +93,12 @@ async def lifespan(app: FastAPI):
             t.cancel()
         await asyncio.gather(*active_run_tasks, return_exceptions=True)
 
+    # FR-017: stop the recurring cleanup loop
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
     await system_monitor.stop()
     db.close()
     await agent_service.unload()
