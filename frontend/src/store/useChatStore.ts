@@ -289,6 +289,10 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       delete remaining[id];
       return { ...state, sessions: remaining };
     });
+    // FR-011: never leave a deleted session as the auto-reconnect target.
+    if (typeof window !== "undefined" && localStorage.getItem("lastSessionId") === id) {
+      localStorage.removeItem("lastSessionId");
+    }
   },
 
   clearAllHistory: async () => {
@@ -305,6 +309,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       return;
     }
     set((state) => ({ ...state, sessions: {} }));
+    if (typeof window !== "undefined") {
+      localStorage.removeItem("lastSessionId");
+    }
   },
 
   migrateSessionId: (oldId, newId) =>
@@ -530,6 +537,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
               activeStep,
               terminalEntries,
               orchestrationResult: oResult,
+              serverStatus: detail.status as SessionData["serverStatus"],
               isLoaded: true
             }
           }
