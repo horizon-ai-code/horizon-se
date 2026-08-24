@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -223,23 +224,34 @@ async def system_monitor_ws(websocket: WebSocket) -> None:
         pass
 
 
-async def _handle_reconnect(session_id: str, ws: WebSocket) -> None:
-    """Handle frontend reconnection to an existing session."""
+async def _handle_reconnect(session_id: str, client_conn: ClientConnection) -> None:
+    """Handle frontend reconnection to an existing session (FR-011).
+
+    Reattachment is done IN PLACE: this socket's own ClientConnection is
+    promoted into orchestrator.current_client so heartbeat pongs keep
+    flowing to the very object the pipeline notifies through. Creating a
+    second connection object here would starve its heartbeat (~30s later
+    all sends get stale-suppressed).
+    """
     if not session_id:
-        await ws.send_json({"type": "error", "code": "MISSING_SESSION_ID", "message": "Missing session_id"})
+        await client_conn.websocket.send_json({"type": "error", "code": "MISSING_SESSION_ID", "message": "Missing session_id"})
+        return
+
+    try:
+        uuid.UUID(session_id)
+    except ValueError:
+        await client_conn.websocket.send_json({"type": "error", "code": "INVALID_SESSION_ID", "message": "session_id must be a UUID"})
         return
 
     record = await connection.get_history_by_id(session_id)
     if not record:
-        await ws.send_json({"type": "error", "code": "SESSION_NOT_FOUND", "message": "Session not found"})
+        await client_conn.websocket.send_json({"type": "error", "code": "SESSION_NOT_FOUND", "message": "Session not found"})
         return
 
-    new_conn = connection.create_websocket_connection(ws)
-    new_conn.id = session_id
-    await new_conn.start_heartbeat()
+    status = record.get("status")
 
-    if record.get("status") == "Completed":
-        await new_conn.send_result(
+    if status == "Completed":
+        await client_conn.send_result(
             final_code=record.get("refactored_code", ""),
             original_complexity=record.get("original_complexity"),
             refactored_complexity=record.get("refactored_complexity"),
@@ -250,26 +262,34 @@ async def _handle_reconnect(session_id: str, ws: WebSocket) -> None:
                 "inference_time": record.get("inference_time", 0),
             },
             exit_status=record.get("exit_status", "UNKNOWN"),
+            planner_model=record.get("planner_model") or "",
+            generator_model=record.get("generator_model") or "",
+            judge_model=record.get("judge_model") or "",
         )
         insights = record.get("insights")
         if insights:
-            await new_conn.send_insights(insights)
-        await new_conn.send_status(Role.System, "Session restored.")
-        await new_conn.stop_heartbeat()
-    elif record.get("status") in ("Processing", "Halted"):
-        if orchestrator.current_client is not None:
-            orchestrator.current_client = new_conn
-            await new_conn.send_status(
-                Role.System,
-                f"Reconnected to ongoing session. Status: {record.get('status')}",
-            )
+            await client_conn.send_insights(insights)
+        await client_conn.send_status(Role.System, "Session restored.")
+
+    elif status == "Processing":
+        active = orchestrator.current_client
+        if active is not None and active.id == session_id:
+            # Live run for THIS session — reattach in place.
+            client_conn.id = session_id
+            orchestrator.current_client = client_conn
+            await client_conn.send_status(Role.System, "Reconnected to ongoing session.")
         else:
-            await new_conn.send_status(
+            # Either no run is active or a different session owns the slot.
+            await client_conn.send_status(
                 Role.System,
-                "Session lost due to server restart. Please start a new refactor.",
+                "Session is not active on the server (it may have been interrupted by a restart). Please start a new refactor.",
             )
+
+    elif status == "Halted":
+        await client_conn.send_status(Role.System, "This session was halted earlier. Start a new refactor to continue.")
+
     else:
-        await ws.send_json({"type": "error", "code": "UNKNOWN_SESSION_STATUS", "message": f"Unknown session status: {record.get('status')}"})
+        await client_conn.websocket.send_json({"type": "error", "code": "UNKNOWN_SESSION_STATUS", "message": f"Unknown session status: {status}"})
 
 
 async def run_single_refactor(

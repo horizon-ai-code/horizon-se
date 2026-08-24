@@ -30,7 +30,10 @@ class MessageRouter:
 
         if msg_type == "reconnect":
             if reconnect_handler:
-                await reconnect_handler(data.get("session_id", ""), client.websocket)
+                # FR-011: pass the connection object itself so the handler can
+                # reattach THIS socket's own ClientConnection (keeps heartbeat
+                # and pong routing on a single object).
+                await reconnect_handler(data.get("session_id", ""), client)
             return True
 
         if msg_type == "single":
