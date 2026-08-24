@@ -43,6 +43,11 @@ system_monitor: SystemMonitor = SystemMonitor()
 # Global lock to serialize all orchestration (model & DB) operations
 orchestration_lock = asyncio.Lock()
 
+# FR-011 resilient runs: live orchestration tasks are tracked process-wide so
+# they survive websocket disconnects (browser refresh/close) instead of being
+# killed alongside the connection. Bounded by EXECUTION_TIMEOUT_SECONDS.
+active_run_tasks: set[asyncio.Task] = set()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -62,6 +67,14 @@ async def lifespan(app: FastAPI):
         print(f"Deleted {deleted} halted sessions")
     await system_monitor.start()
     yield
+
+    # FR-011 resilient runs: cancel any still-running orchestrations so their
+    # CancelledError handlers persist a final (Halted) state before DB close.
+    if active_run_tasks:
+        for t in list(active_run_tasks):
+            t.cancel()
+        await asyncio.gather(*active_run_tasks, return_exceptions=True)
+
     await system_monitor.stop()
     db.close()
     await agent_service.unload()
@@ -128,7 +141,6 @@ async def entrypoint(websocket: WebSocket) -> None:
         websocket=websocket
     )
     await client_conn.start_heartbeat()
-    active_tasks: set[asyncio.Task] = set()
 
     async def run_orchestration(client, validated_data: RefactorRequest):
         try:
@@ -178,7 +190,7 @@ async def entrypoint(websocket: WebSocket) -> None:
                 await client_conn.send_status(Role.System, "System is busy. Your request has been queued and will start automatically.")
 
             handled = await router.dispatch(
-                data, client_conn, active_tasks,
+                data, client_conn, active_run_tasks,
                 run_single_refactor, run_orchestration,
                 reconnect_handler=_handle_reconnect,
             )
@@ -186,19 +198,14 @@ async def entrypoint(websocket: WebSocket) -> None:
                 continue
 
     except WebSocketDisconnect as e:
-        print(f"Connection disconnected: {e}")
-        agent_service.stop()
-        for task in active_tasks.copy():
-            if not task.done():
-                task.cancel()
+        # FR-011 resilient runs: the client is gone but any in-flight run
+        # keeps executing server-side; logs/results persist to the DB and
+        # the client can reattach later via {"type": "reconnect"}.
+        print(f"Client disconnected (run continues): {e}")
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:
         await client_conn.stop_heartbeat()
-        agent_service.stop()
-        for task in active_tasks.copy():
-            if not task.done():
-                task.cancel()
 
 
 @app.websocket("/ws/system")
