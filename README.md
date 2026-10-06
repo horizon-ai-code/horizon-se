@@ -32,16 +32,18 @@ _AI-driven Java refactoring pipeline powered by multi-agent LLM orchestration._
 
 ## Installation
 
-### GPU (NVIDIA recommended)
+### Automatic Installation
 
+The repository includes scripts that will automatically detect if you have a compatible NVIDIA GPU (≥4GB VRAM) and launch the appropriate Docker container.
+
+**Linux / macOS**
 ```bash
-curl -sL https://raw.githubusercontent.com/horizon-ai-code/horizon/main/docker-compose.yml | docker compose -f - up -d
+bash installation/install.sh
 ```
 
-### CPU (any machine)
-
-```bash
-curl -sL https://raw.githubusercontent.com/horizon-ai-code/horizon/main/docker-compose.cpu.yml | docker compose -f - up -d
+**Windows (PowerShell)**
+```powershell
+.\installation\install.ps1
 ```
 
 Open [http://localhost:3000](http://localhost:3000)
